@@ -13,7 +13,7 @@ psutil = "==5.7.0"
 
 [dev-packages]
 Fabric = "==1.14.1"
-grpcio-tools = "==1.38.0"
+grpcio-tools = "==1.50.0"
 gunicorn = "*"
 isort = "*"
 mock = "==2.0.0"
