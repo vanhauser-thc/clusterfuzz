@@ -167,7 +167,7 @@ def _get_impact_from_labels(labels):
   return data_types.SecurityImpact.MISSING
 
 
-def update_issue_impact_labels(testcase, issue):
+def update_issue_impact_labels(testcase, issue, policy):
   """Update impact labels on issue."""
   if testcase.one_time_crasher_flag:
     return
@@ -203,9 +203,13 @@ def update_issue_impact_labels(testcase, issue):
     return
 
   if existing_impact != data_types.SecurityImpact.MISSING:
-    issue.labels.remove('Security_Impact-' + impact_to_string(existing_impact))
+    issue.labels.remove(
+        policy.substitution_mapping('Security_Impact-' +
+                                    impact_to_string(existing_impact)))
 
-  issue.labels.add('Security_Impact-' + impact_to_string(new_impact))
+  issue.labels.add(
+      policy.substitution_mapping('Security_Impact-' +
+                                  impact_to_string(new_impact)))
 
 
 def update_issue_foundin_labels(testcase, issue):
@@ -219,9 +223,10 @@ def update_issue_foundin_labels(testcase, issue):
       ] if x
   ]
   milestones_foundin = {x.split('.')[0] for x in versions_foundin}
+  if milestones_foundin:
+    # Only cleanup previous FoundIn labels if we have new ones to add.
+    issue.labels.remove_by_prefix('FoundIn-')
   for found_milestone in milestones_foundin:
-    if f'foundin-{found_milestone}' in issue.labels:
-      continue
     issue.labels.add('FoundIn-' + found_milestone)
 
 
@@ -245,8 +250,9 @@ def apply_substitutions(policy, label, testcase, security_severity=None):
           for label in handler(label, testcase, security_severity)
       ]
 
-  # No match found. Return unmodified label.
-  return [label]
+  # No match found. Return mapped value if it exists else the original label
+  # will be returned.
+  return [policy.substitution_mapping(label)]
 
 
 def get_label_pattern(label):
@@ -299,9 +305,9 @@ def notify_issue_update(testcase, status):
       ])
 
   if status in ('verified', 'wontfix'):
-    logs.log(f'Closing issue {testcase.github_issue_num} '
-             f'in GitHub repo {testcase.github_repo_id}: '
-             f'Testcase {testcase.key.id()} is marked as {status}.')
+    logs.info(f'Closing issue {testcase.github_issue_num} '
+              f'in GitHub repo {testcase.github_repo_id}: '
+              f'Testcase {testcase.key.id()} is marked as {status}.')
     oss_fuzz_github.close_issue(testcase)
 
 
@@ -314,7 +320,7 @@ def check_miracleptr_status(testcase):
       try:
         return MIRACLEPTR_STATUS[status]
       except:
-        logs.log_error(f'Unknown MiraclePtr status: {line}')
+        logs.error(f'Unknown MiraclePtr status: {line}')
         break
   return None
 
@@ -325,7 +331,7 @@ def file_issue(testcase,
                user_email=None,
                additional_ccs=None):
   """File an issue for the given test case."""
-  logs.log(f'Filing new issue for testcase: {testcase.key.id()}.')
+  logs.info(f'Filing new issue for testcase: {testcase.key.id()}.')
 
   policy = issue_tracker_policy.get(issue_tracker.project)
   is_crash = not utils.sub_string_exists_in(NON_CRASH_TYPES,
@@ -345,32 +351,39 @@ def file_issue(testcase,
     issue.labels.add(policy.label('reproducible'))
 
   # Chromium-specific labels.
-  if issue_tracker.project == 'chromium':
+  if issue_tracker.project in ('chromium', 'chromium-testing'):
     if testcase.security_flag:
       # Add reward labels if this is from an external fuzzer contribution.
       fuzzer = data_types.Fuzzer.query(
           data_types.Fuzzer.name == testcase.fuzzer_name).get()
       if fuzzer and fuzzer.external_contribution:
-        issue.labels.add('reward-topanel')
-        issue.labels.add('External-Fuzzer-Contribution')
+        issue.labels.add(policy.substitution_mapping('reward-topanel'))
+        issue.labels.add(
+            policy.substitution_mapping('External-Fuzzer-Contribution'))
 
-      update_issue_impact_labels(testcase, issue)
+      update_issue_impact_labels(testcase, issue, policy)
 
     # Check for MiraclePtr in stacktrace.
     miracle_label = check_miracleptr_status(testcase)
     if miracle_label:
-      issue.labels.add(miracle_label)
+      issue.labels.add(policy.substitution_mapping(miracle_label))
 
   # Add additional labels from the job definition and fuzzer.
   additional_labels = data_handler.get_additional_values_for_variable(
       'AUTOMATIC_LABELS', testcase.job_type, testcase.fuzzer_name)
   for label in additional_labels:
-    issue.labels.add(label)
+    issue.labels.add(policy.substitution_mapping(label))
 
   # Add crash-type-specific label
   crash_type_label = policy.label_for_crash_type(testcase.crash_type)
   if crash_type_label:
-    issue.labels.add(crash_type_label)
+    issue.labels.add(policy.substitution_mapping(crash_type_label))
+
+  # Add labels from crash metadata.
+  for crash_category in testcase.get_metadata('crash_categories', []):
+    crash_category_label = policy.label_for_crash_category(crash_category)
+    if crash_category_label:
+      issue.labels.add(policy.substitution_mapping(crash_category_label))
 
   # Add additional components from the job definition and fuzzer.
   automatic_components = data_handler.get_additional_values_for_variable(
@@ -391,7 +404,7 @@ def file_issue(testcase,
   if fuzzer_metadata and 'assignee' in fuzzer_metadata:
     issue.status = policy.status('assigned')
     issue.assignee = fuzzer_metadata['assignee']
-    logs.log('Testcase has assignee metadata %s' % issue.assignee)
+    logs.info('Testcase has assignee metadata %s' % issue.assignee)
 
   # Add additional ccs from the job definition and fuzzer.
   ccs = data_handler.get_additional_values_for_variable(
@@ -456,10 +469,13 @@ def file_issue(testcase,
   for cc in ccs:
     issue.ccs.add(cc)
 
+  # Apply extension fields.
+  issue.apply_extension_fields(properties.extension_fields)
+
   # Add additional labels and components from testcase metadata.
   metadata_labels = _get_from_metadata(testcase, 'issue_labels')
   for label in metadata_labels:
-    issue.labels.add(label)
+    issue.labels.add(policy.substitution_mapping(label))
 
   metadata_components = _get_from_metadata(testcase, 'issue_components')
   for component in metadata_components:
@@ -469,6 +485,10 @@ def file_issue(testcase,
     issue.components.add(policy.unreproducible_component)
 
   issue.reporter = user_email
+
+  if issue_tracker.project in ('chromium', 'chromium-testing'):
+    logs.info(
+        'google_issue_tracker labels before saving: %s' % list(issue.labels))
 
   recovered_exception = None
   try:

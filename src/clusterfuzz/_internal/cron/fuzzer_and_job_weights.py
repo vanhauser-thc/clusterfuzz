@@ -36,7 +36,6 @@ SpecificationMatch = collections.namedtuple('SpecificationMatch',
 DEFAULT_MULTIPLIER = 30.0  # Used for blackbox and jobs that are not yet run.
 DEFAULT_SANITIZER_WEIGHT = 0.1
 DEFAULT_ENGINE_WEIGHT = 1.0
-TARGET_COUNT_WEIGHT_CAP = 100.0
 
 SANITIZER_BASE_WEIGHT = 0.1
 
@@ -50,8 +49,10 @@ SANITIZER_WEIGHTS = {
 }
 
 ENGINE_WEIGHTS = {
-    'libFuzzer': 1.0,
     'afl': 1.0,
+    'centipede': 1.0,
+    'googlefuzztest': 0.5,
+    'libFuzzer': 1.0,
     'honggfuzz': 0.2,
 }
 
@@ -277,8 +278,8 @@ def update_weight_for_target(fuzz_target_name, job, match):
     return
 
   weight = match.new_weight
-  logs.log('Adjusted weight to %f for target %s and job %s (%s).' %
-           (weight, fuzz_target_name, job, match.reason))
+  logs.info('Adjusted weight to %f for target %s and job %s (%s).' %
+            (weight, fuzz_target_name, job, match.reason))
 
   target_job.weight = weight
   target_job.put()
@@ -332,7 +333,7 @@ def update_target_weights_for_engine(client, engine, specifications):
 
     update_weight_for_target(fuzzer, job, match)
 
-  logs.log('Weight adjustments complete for engine %s.' % engine)
+  logs.info('Weight adjustments complete for engine %s.' % engine)
 
 
 def store_current_weights_in_bigquery():
@@ -380,7 +381,6 @@ def update_job_weights():
       # the default weight in that case to allow for recovery.
       if targets_count and targets_count.count:
         multiplier = targets_count.count
-        multiplier = min(multiplier, TARGET_COUNT_WEIGHT_CAP)
 
     update_job_weight(job.name, multiplier)
 
@@ -394,5 +394,5 @@ def main():
   update_job_weights()
 
   store_current_weights_in_bigquery()
-  logs.log('Fuzzer and job weights succeeded.')
+  logs.info('Fuzzer and job weights succeeded.')
   return True

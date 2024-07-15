@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Handler used for setting up oss-fuzz jobs."""
+"""Handler used for setting up oss-fuzz and android jobs."""
 
 import base64
 import collections
@@ -35,7 +35,6 @@ from clusterfuzz._internal.fuzzing import fuzzer_selection
 from clusterfuzz._internal.google_cloud_utils import pubsub
 from clusterfuzz._internal.google_cloud_utils import storage
 from clusterfuzz._internal.metrics import logs
-from clusterfuzz._internal.system import environment
 
 from . import service_accounts
 
@@ -47,8 +46,8 @@ LOGS_LIFECYCLE = storage.generate_life_cycle_config('Delete', age=14)
 QUARANTINE_LIFECYCLE = storage.generate_life_cycle_config('Delete', age=90)
 
 JOB_TEMPLATE = ('{build_type} = {build_bucket_path}\n'
-                'PROJECT_NAME = {project}\n'
-                'SUMMARY_PREFIX = {project}\n'
+                'PROJECT_NAME = {project_name}\n'
+                'SUMMARY_PREFIX = {project_name}\n'
                 'MANAGED = True\n')
 
 OBJECT_VIEWER_IAM_ROLE = 'roles/storage.objectViewer'
@@ -72,6 +71,8 @@ OSS_FUZZ_MEMORY_SAFE_LANGUAGE_PROJECT_WEIGHT = 0.2
 SetupResult = collections.namedtuple('SetupResult', 'project_names job_names')
 
 HTTP_TIMEOUT_SECONDS = 30
+
+PROJECTS_USING_SUBQUEUES = {'android'}
 
 
 class ProjectSetupError(Exception):
@@ -106,6 +107,11 @@ class JobInfo:
 # the earlier ones. An engine template may override vars set for a sanitizer.
 LIBFUZZER_ASAN_JOB = JobInfo('libfuzzer_asan_', 'libfuzzer', 'address',
                              ['libfuzzer', 'engine_asan', 'prune'])
+LIBFUZZER_HWASAN_JOB = JobInfo(
+    'libfuzzer_hwasan_',
+    'libfuzzer',
+    'hardware', ['libfuzzer', 'engine_asan'],
+    architecture='arm')
 LIBFUZZER_MSAN_JOB = JobInfo('libfuzzer_msan_', 'libfuzzer', 'memory',
                              ['libfuzzer', 'engine_msan'])
 LIBFUZZER_UBSAN_JOB = JobInfo('libfuzzer_ubsan_', 'libfuzzer', 'undefined',
@@ -159,11 +165,15 @@ JOB_MAP = {
             'address': LIBFUZZER_ASAN_I386_JOB,
             'none': LIBFUZZER_NONE_I386_JOB,
         },
+        'arm': {
+            'hardware': LIBFUZZER_HWASAN_JOB,
+            'none': LIBFUZZER_NONE_JOB,
+        },
     },
     'afl': {
         'x86_64': {
             'address': AFL_ASAN_JOB,
-        }
+        },
     },
     'honggfuzz': {
         'x86_64': {
@@ -180,7 +190,7 @@ JOB_MAP = {
     'none': {
         'x86_64': {
             'address': NO_ENGINE_ASAN_JOB,
-        }
+        },
     },
     'centipede': {
         'x86_64': {
@@ -191,7 +201,7 @@ JOB_MAP = {
 
 DEFAULT_ARCHITECTURES = ['x86_64']
 DEFAULT_SANITIZERS = ['address', 'undefined']
-DEFAULT_ENGINES = ['libfuzzer', 'afl', 'honggfuzz']
+DEFAULT_ENGINES = ['libfuzzer', 'afl', 'honggfuzz', 'centipede']
 
 
 def _to_experimental_job(job_info):
@@ -210,7 +220,7 @@ def get_github_url(url):
   response = requests.get(
       url, auth=(client_id, client_secret), timeout=HTTP_TIMEOUT_SECONDS)
   if response.status_code != 200:
-    logs.log_error(
+    logs.error(
         f'Failed to get github url: {url}.', status_code=response.status_code)
     response.raise_for_status()
 
@@ -235,7 +245,7 @@ def get_oss_fuzz_projects():
 
   projects_url = find_github_item_url(tree, 'projects')
   if not projects_url:
-    logs.log_error('No projects found.')
+    logs.error('No projects found.')
     return []
 
   tree = get_github_url(projects_url)
@@ -263,7 +273,11 @@ def get_oss_fuzz_projects():
 
 def get_projects_from_gcs(gcs_url):
   """Get projects from GCS path."""
-  data = json.loads(storage.read_data(gcs_url))
+  try:
+    data = json.loads(storage.read_data(gcs_url))
+  except json.decoder.JSONDecodeError as e:
+    raise ProjectSetupError(f'Error loading json file from {gcs_url}: {e}')
+
   return [(project['name'], project) for project in data['projects']]
 
 
@@ -297,7 +311,7 @@ def get_jobs_for_project(project, info):
   sanitizers = _process_sanitizers_field(
       info.get('sanitizers', DEFAULT_SANITIZERS))
   if not sanitizers:
-    logs.log_error(f'Invalid sanitizers field for {project}.')
+    logs.error(f'Invalid sanitizers field for {project}.')
     return []
 
   engines = info.get('fuzzing_engines', DEFAULT_ENGINES)
@@ -368,7 +382,7 @@ def _add_users_to_bucket(info, client, bucket_name, iam_policy):
     if cc in binding['members']:
       continue
 
-    logs.log(f'Adding {cc} to bucket IAM for {bucket_name}.')
+    logs.info(f'Adding {cc} to bucket IAM for {bucket_name}.')
     # Add CCs one at a time since the API does not work with invalid or
     # non-Google emails.
     modified_iam_policy = storage.add_single_bucket_iam(
@@ -477,7 +491,7 @@ def update_fuzzer_jobs(fuzzer_entities, job_names):
       if job.name in job_names:
         continue
 
-      logs.log(f'Deleting job {job.name}')
+      logs.info(f'Deleting job {job.name}')
       to_delete[job.name] = job.key
 
       try:
@@ -498,7 +512,7 @@ def cleanup_old_projects_settings(project_names):
 
   for project in data_types.OssFuzzProject.query():
     if project.name not in project_names:
-      logs.log(f'Deleting project {project.name}.')
+      logs.info(f'Deleting project {project.name}.')
       to_delete.append(project.key)
 
   if to_delete:
@@ -543,20 +557,33 @@ def create_project_settings(project, info, service_account):
         ccs=ccs).put()
 
 
-def create_pubsub_topics(project):
-  """Create pubsub topics for tasks."""
+def _create_pubsub_topic(name, client):
+  """Create a pubsub topic and subscription if needed."""
+  application_id = utils.get_application_id()
+
+  topic_name = pubsub.topic_name(application_id, name)
+  if client.get_topic(topic_name) is None:
+    client.create_topic(topic_name)
+
+  subscription_name = pubsub.subscription_name(application_id, name)
+  if client.get_subscription(subscription_name) is None:
+    client.create_subscription(subscription_name, topic_name)
+
+
+def create_pubsub_topics_for_untrusted(project):
+  """Create pubsub topics from untrusted sources for tasks."""
+  client = pubsub.PubSubClient()
   for platform in PUBSUB_PLATFORMS:
     name = untrusted.queue_name(project, platform)
-    client = pubsub.PubSubClient()
-    application_id = utils.get_application_id()
+    _create_pubsub_topic(name, client)
 
-    topic_name = pubsub.topic_name(application_id, name)
-    if client.get_topic(topic_name) is None:
-      client.create_topic(topic_name)
 
-    subscription_name = pubsub.subscription_name(application_id, name)
-    if client.get_subscription(subscription_name) is None:
-      client.create_subscription(subscription_name, topic_name)
+def create_pubsub_topics_for_queue_id(platform):
+  """Create pubsub topics from project configs for tasks."""
+  platform, queue_id = platform.split(tasks.SUBQUEUE_IDENTIFIER)
+  name = untrusted.queue_name(platform, queue_id)
+  client = pubsub.PubSubClient()
+  _create_pubsub_topic(name, client)
 
 
 def cleanup_pubsub_topics(project_names):
@@ -636,10 +663,6 @@ class ProjectSetup:
     """Deployment bucket name."""
     return f'{utils.get_application_id()}-deployment'
 
-  def _shared_corpus_bucket_name(self):
-    """Shared corpus bucket name."""
-    return environment.get_value('SHARED_CORPUS_BUCKET')
-
   def _backup_bucket_name(self, project_name):
     """Return the backup_bucket_name."""
     return project_name + '-backup.' + data_handler.bucket_domain_suffix()
@@ -684,13 +707,10 @@ class ProjectSetup:
       add_bucket_iams(info, client, logs_bucket_name, service_account)
       add_bucket_iams(info, client, quarantine_bucket_name, service_account)
     except Exception as e:
-      logs.log_error(f'Failed to add bucket IAMs for {project}: {e}.')
+      logs.error(f'Failed to add bucket IAMs for {project}: {e}.')
 
-    # Grant the service account read access to deployment, shared corpus and
-    # mutator plugin buckets.
+    # Grant the service account read access to deployment bucket.
     add_service_account_to_bucket(client, self._deployment_bucket_name(),
-                                  service_account, OBJECT_VIEWER_IAM_ROLE)
-    add_service_account_to_bucket(client, self._shared_corpus_bucket_name(),
                                   service_account, OBJECT_VIEWER_IAM_ROLE)
     data_bundles = {
         fuzzer_entity.get().data_bundle_name
@@ -723,6 +743,13 @@ class ProjectSetup:
     build_path = build_path.replace('%ENGINE%', engine)
     build_path = build_path.replace('%SANITIZER%', memory_tool)
     return build_path
+
+  def _get_base_project_name(self, project):
+    """Returns the base project if subqueues are being used."""
+    for base_project in PROJECTS_USING_SUBQUEUES:
+      if project.startswith(base_project):
+        return base_project
+    return project
 
   def _sync_job(self, project, info, corpus_bucket_name, quarantine_bucket_name,
                 logs_bucket_name, backup_bucket_name):
@@ -768,7 +795,6 @@ class ProjectSetup:
       if self._segregate_projects:
         job.platform = untrusted.platform_name(project, 'linux')
       else:
-        # TODO(ochang): Support other platforms?
         job.platform = 'LINUX'
 
       job.templates = template.cf_job_templates
@@ -781,11 +807,12 @@ class ProjectSetup:
         build_bucket_path = self._get_build_bucket_path(
             project, info, template.engine, template.memory_tool,
             template.architecture)
+      base_project_name = self._get_base_project_name(project)
       job.environment_string = JOB_TEMPLATE.format(
           build_type=self._build_type,
           build_bucket_path=build_bucket_path,
           engine=template.engine,
-          project=project)
+          project_name=base_project_name)
 
       # Centipede requires a separate build of the sanitized binary.
       if template.engine == 'centipede':
@@ -846,9 +873,8 @@ class ProjectSetup:
           job.environment_string += (
               f'ISSUE_VIEW_RESTRICTIONS = {view_restrictions}\n')
         else:
-          logs.log_error(
-              f'Invalid view restriction setting {view_restrictions} '
-              f'for project {project}.')
+          logs.error(f'Invalid view restriction setting {view_restrictions} '
+                     f'for project {project}.')
 
       if not has_maintainer(info):
         job.environment_string += 'DISABLE_DISCLOSURE = True\n'
@@ -864,19 +890,16 @@ class ProjectSetup:
       file_github_issue = info.get('file_github_issue', False)
       job.environment_string += f'FILE_GITHUB_ISSUE = {file_github_issue}\n'
 
-      if (template.engine == 'libfuzzer' and
-          template.architecture == 'x86_64' and
-          'dataflow' in info.get('fuzzing_engines', DEFAULT_ENGINES)):
-        # Dataflow binaries are built with dataflow sanitizer, but can be used
-        # as an auxiliary build with libFuzzer builds (e.g. with ASan or UBSan).
-        dataflow_build_bucket_path = self._get_build_bucket_path(
-            project_name=project,
-            info=info,
-            engine='dataflow',
-            memory_tool='dataflow',
-            architecture=template.architecture)
-        job.environment_string += (
-            f'DATAFLOW_BUILD_BUCKET_PATH = {dataflow_build_bucket_path}\n')
+      # Device-specific queues created during project setup.
+      queue_id = info.get('queue_id', False)
+      if queue_id:
+        platform = info.get('platform',
+                            'LINUX').upper() + ':' + queue_id.upper()
+        job.platform = platform
+        if platform.startswith('ANDROID'):
+          job.templates.append('android')
+
+        create_pubsub_topics_for_queue_id(job.platform)
 
       if self._additional_vars:
         additional_vars = {}
@@ -936,7 +959,7 @@ class ProjectSetup:
     up."""
     job_names = []
     for project, info in projects:
-      logs.log(f'Syncing configs for {project}.')
+      logs.info(f'Syncing configs for {project}.')
 
       backup_bucket_name = None
       corpus_bucket_name = None
@@ -959,7 +982,7 @@ class ProjectSetup:
         self.sync_user_permissions(project, info)
 
         # Create Pub/Sub topics for tasks.
-        create_pubsub_topics(project)
+        create_pubsub_topics_for_untrusted(project)
 
         # Set up projects settings (such as CPU distribution settings).
         if not info.get('disabled', False):
@@ -988,30 +1011,30 @@ def main():
   libfuzzer = data_types.Fuzzer.query(
       data_types.Fuzzer.name == 'libFuzzer').get()
   if not libfuzzer:
-    logs.log_error('Failed to get libFuzzer Fuzzer entity.')
+    logs.error('Failed to get libFuzzer Fuzzer entity.')
     return False
 
   afl = data_types.Fuzzer.query(data_types.Fuzzer.name == 'afl').get()
   if not afl:
-    logs.log_error('Failed to get AFL Fuzzer entity.')
+    logs.error('Failed to get AFL Fuzzer entity.')
     return False
 
   honggfuzz = data_types.Fuzzer.query(
       data_types.Fuzzer.name == 'honggfuzz').get()
   if not honggfuzz:
-    logs.log_error('Failed to get honggfuzz Fuzzer entity.')
+    logs.error('Failed to get honggfuzz Fuzzer entity.')
     return False
 
   gft = data_types.Fuzzer.query(
       data_types.Fuzzer.name == 'googlefuzztest').get()
   if not gft:
-    logs.log_error('Failed to get googlefuzztest Fuzzer entity.')
+    logs.error('Failed to get googlefuzztest Fuzzer entity.')
     return False
 
   centipede = data_types.Fuzzer.query(
       data_types.Fuzzer.name == 'centipede').get()
   if not centipede:
-    logs.log_error('Failed to get Centipede Fuzzer entity.')
+    logs.error('Failed to get Centipede Fuzzer entity.')
     return False
 
   project_config = local_config.ProjectConfig()
@@ -1045,11 +1068,11 @@ def main():
         engine_build_buckets={
             'libfuzzer': bucket_config.get('libfuzzer'),
             'libfuzzer-i386': bucket_config.get('libfuzzer_i386'),
+            'libfuzzer-arm': bucket_config.get('libfuzzer_arm'),
             'afl': bucket_config.get('afl'),
             'honggfuzz': bucket_config.get('honggfuzz'),
             'googlefuzztest': bucket_config.get('googlefuzztest'),
             'none': bucket_config.get('no_engine'),
-            'dataflow': bucket_config.get('dataflow'),
             'centipede': bucket_config.get('centipede'),
         },
         fuzzer_entities=fuzzer_entities,
@@ -1076,5 +1099,5 @@ def main():
       list(fuzzer_entities.values()), project_names, job_names,
       segregate_projects)
 
-  logs.log('Project setup succeeded.')
+  logs.info('Project setup succeeded.')
   return True

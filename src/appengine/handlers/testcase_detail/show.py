@@ -17,8 +17,9 @@ import datetime
 import html
 import re
 
-from flask import request
+import flask
 import jinja2
+import markupsafe
 
 from clusterfuzz._internal.base import utils
 from clusterfuzz._internal.build_management import revisions
@@ -200,7 +201,8 @@ def filter_stacktrace(crash_stacktrace, crash_type, revisions_dict, platform,
     line = html.escape(line, quote=True)
     line = linkifier.linkify_stack_frame(line)
 
-    if 'android' in platform or environment.is_lkl_job(job_type):
+    is_android = platform is not None and 'android' in platform
+    if is_android or environment.is_lkl_job(job_type):
       line = _linkify_android_kernel_stack_frame_if_needed(line)
 
     filtered_crash_lines.append(line)
@@ -296,7 +298,7 @@ def convert_to_lines(raw_stacktrace, crash_state_lines, crash_type):
   raw_lines = raw_stacktrace.splitlines()
 
   frames = get_stack_frames(crash_state_lines)
-  escaped_frames = [jinja2.escape(f) for f in frames]
+  escaped_frames = [markupsafe.escape(f) for f in frames]
   combined_frames = frames + escaped_frames
 
   # Certain crash types have their own customized frames that are not related to
@@ -627,7 +629,7 @@ class DeprecatedHandler(base_handler.Handler):
 
   def get(self):
     """Serve the redirect to the current test case detail page."""
-    testcase_id = request.args.get('key')
+    testcase_id = flask.request.args.get('key')
     if not testcase_id:
       raise helpers.EarlyExitError('No testcase key provided.', 400)
 
@@ -641,5 +643,5 @@ class RefreshHandler(base_handler.Handler):
   @handler.oauth
   def post(self):
     """Serve the testcase detail JSON."""
-    testcase_id = request.get('testcaseId')
+    testcase_id = flask.request.get('testcaseId')
     return self.render_json(get_testcase_detail_by_id(testcase_id))

@@ -15,7 +15,11 @@
 # Copy some commonly linked library versions from xenial for backwards
 # compatibility with older builds.
 FROM ubuntu:16.04 as xenial
-ENV DEBIAN_FRONTEND noninteractive
+
+# Prevent interactive prompts during package installation. This seems to work
+# better than `ENV DEBIAN_FRONTEND=noninteractive` for some reason.
+RUN echo 'debconf debconf/frontend select Noninteractive' | debconf-set-selections
+
 RUN apt-get update && \
     apt-get install -y \
       libcurl3-gnutls \
@@ -25,10 +29,11 @@ RUN apt-get update && \
 
 FROM ubuntu:20.04
 
+# And again with the newest ubuntu image.
+RUN echo 'debconf debconf/frontend select Noninteractive' | debconf-set-selections
+
 RUN mkdir /data
 WORKDIR /data
-
-ENV DEBIAN_FRONTEND noninteractive
 
 RUN apt-get update && \
     apt-get upgrade -y && \
@@ -113,8 +118,8 @@ RUN echo "deb https://packages.cloud.google.com/apt cloud-sdk main" \
 # Set up google-fluentd
 # We ignore errors in install-logging-agent.sh as it always fails to start
 # after installation without a metadata server.
-RUN curl -sSO https://dl.google.com/cloudagents/install-logging-agent.sh && \
-    bash install-logging-agent.sh || true && \
+RUN curl -sSO https://dl.google.com/cloudagents/add-logging-agent-repo.sh && \
+    bash add-logging-agent-repo.sh --also-install --version=1.10.1 || true && \
     sed -i 's/flush_interval 5s/flush_interval 60s/' /etc/google-fluentd/google-fluentd.conf
 COPY clusterfuzz-fluentd.conf /etc/google-fluentd/config.d/clusterfuzz.conf
 
@@ -142,6 +147,10 @@ RUN locale-gen en_US.UTF-8
 ENV LANG en_US.UTF-8
 ENV PYTHONIOENCODING UTF-8
 
-COPY setup_common.sh setup_clusterfuzz.sh start_clusterfuzz.sh setup_mock_metadata.sh start.sh /data/
-CMD ["bash", "-ex", "/data/start.sh"]
+COPY setup_common.sh setup_clusterfuzz.sh start_clusterfuzz.sh setup_mock_metadata.sh Pipfile Pipfile.lock start.sh /data/
+RUN cd /data && \
+    # Make pip3.7 the default so that pipenv install --system works.
+    mv /usr/local/bin/pip3.7 /usr/local/bin/pip && \
+    pipenv install --deploy --system
 
+CMD ["bash", "-ex", "/data/start.sh"]

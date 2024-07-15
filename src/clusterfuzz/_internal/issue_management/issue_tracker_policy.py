@@ -28,12 +28,14 @@ EXPECTED_STATUSES = [
     'new',
 ]
 
+EXTENSION_PREFIX = '_ext_'
+
 
 class ConfigurationError(Exception):
   """Base configuration error class."""
 
 
-class NewIssuePolicy(object):
+class NewIssuePolicy:
   """New issue policy."""
 
   def __init__(self):
@@ -42,13 +44,16 @@ class NewIssuePolicy(object):
     self.labels = []
     self.issue_body_footer = ''
 
+    # Contains _ext_ prefixed extension fields. Eg: _ext_collaborators.
+    self.extension_fields = {}
+
 
 def _to_str_list(values):
   """Convert a list to a list of strs."""
   return [str(value) for value in values]
 
 
-class IssueTrackerPolicy(object):
+class IssueTrackerPolicy:
   """Represents an issue tracker policy."""
 
   def __init__(self, data):
@@ -68,6 +73,16 @@ class IssueTrackerPolicy(object):
     """Get the actual status string for the given type."""
     return self._data['status'][status_type]
 
+  def get_extension_fields(self, issue_type):
+    """Returns all _ext_ prefixed items from issue_type."""
+    extension_fields = {}
+    # Extension fields are dynamically added to the policy
+    # depending on which (if any) have been set in the config
+    for k, v in issue_type.items():
+      if k.startswith(EXTENSION_PREFIX):
+        extension_fields[k] = v
+    return extension_fields
+
   def label(self, label_type):
     """Get the actual label string for the given type."""
     label = self._data['labels'].get(label_type)
@@ -83,6 +98,18 @@ class IssueTrackerPolicy(object):
 
     crash_type = crash_type.splitlines()[0].lower()
     label = self._data['labels']['crash_types'].get(crash_type)
+    if label is None:
+      return None
+
+    return str(label)
+
+  def label_for_crash_category(self, crash_category):
+    """Get the actual label string for the given crash subtype."""
+    if 'crash_categories' not in self._data['labels']:
+      return None
+
+    crash_category = crash_category.splitlines()[0].lower()
+    label = self._data['labels']['crash_categories'].get(crash_category)
     if label is None:
       return None
 
@@ -164,6 +191,9 @@ class IssueTrackerPolicy(object):
       non_crash_labels = issue_type.get('non_crash_labels')
       if non_crash_labels:
         policy.labels.extend(_to_str_list(non_crash_labels))
+
+    for k, v in self.get_extension_fields(issue_type).items():
+      policy.extension_fields[k] = v
 
   def get_existing_issue_properties(self):
     """Get the properties to apply to a new issue."""

@@ -91,7 +91,8 @@ def _deploy_app_prod(project,
                      deployment_bucket,
                      yaml_paths,
                      package_zip_paths,
-                     deploy_appengine=True):
+                     deploy_appengine=True,
+                     test_deployment=False):
   """Deploy app in production."""
   if deploy_appengine:
     services = _get_services(yaml_paths)
@@ -109,9 +110,13 @@ def _deploy_app_prod(project,
 
   if package_zip_paths:
     for package_zip_path in package_zip_paths:
-      _deploy_zip(deployment_bucket, package_zip_path)
+      _deploy_zip(
+          deployment_bucket, package_zip_path, test_deployment=test_deployment)
 
-    _deploy_manifest(deployment_bucket, constants.PACKAGE_TARGET_MANIFEST_PATH)
+    _deploy_manifest(
+        deployment_bucket,
+        constants.PACKAGE_TARGET_MANIFEST_PATH,
+        test_deployment=test_deployment)
 
 
 def _deploy_app_staging(project, yaml_paths):
@@ -212,22 +217,26 @@ def find_file_exceeding_limit(path, limit):
   return None
 
 
-def _deploy_zip(bucket_name, zip_path):
+def _deploy_zip(bucket_name, zip_path, test_deployment=False):
   """Deploy zip to GCS."""
-  common.execute('gsutil cp %s gs://%s/%s' % (zip_path, bucket_name,
-                                              os.path.basename(zip_path)))
-
-
-def _deploy_manifest(bucket_name, manifest_path):
-  """Deploy source manifest to GCS."""
-  if sys.version_info.major == 3:
-    manifest_suffix = '.3'
+  if test_deployment:
+    common.execute(f'gsutil cp {zip_path} gs://{bucket_name}/test-deployment/'
+                   f'{os.path.basename(zip_path)}')
   else:
-    manifest_suffix = ''
+    common.execute('gsutil cp %s gs://%s/%s' % (zip_path, bucket_name,
+                                                os.path.basename(zip_path)))
 
-  common.execute('gsutil cp %s '
-                 'gs://%s/clusterfuzz-source.manifest%s' %
-                 (manifest_path, bucket_name, manifest_suffix))
+
+def _deploy_manifest(bucket_name, manifest_path, test_deployment=False):
+  """Deploy source manifest to GCS."""
+  if test_deployment:
+    common.execute(f'gsutil cp {manifest_path} '
+                   f'gs://{bucket_name}/test-deployment/'
+                   f'clusterfuzz-source.manifest.3')
+  else:
+    common.execute(f'gsutil cp {manifest_path} '
+                   f'gs://{bucket_name}/'
+                   f'clusterfuzz-source.manifest.3')
 
 
 def _update_deployment_manager(project, name, config_path):
@@ -362,7 +371,7 @@ def is_diff_origin_master():
   return diff_output.strip() or remote_sha.strip() != local_sha.strip()
 
 
-def _staging_deployment_helper(python3=True):
+def _staging_deployment_helper():
   """Helper for staging deployment."""
   config = local_config.Config(local_config.GAE_CONFIG_PATH)
   project = config.get('application_id')
@@ -370,11 +379,7 @@ def _staging_deployment_helper(python3=True):
   print('Deploying %s to staging.' % project)
   deployment_config = config.sub_config('deployment')
 
-  if python3:
-    path = 'staging3'
-  else:
-    path = 'staging'
-
+  path = 'staging3'
   yaml_paths = deployment_config.get_absolute_path(path)
 
   _deploy_app_staging(project, yaml_paths)
@@ -385,7 +390,7 @@ def _prod_deployment_helper(config_dir,
                             package_zip_paths,
                             deploy_appengine=True,
                             deploy_k8s=True,
-                            python3=True):
+                            test_deployment=False):
   """Helper for production deployment."""
   config = local_config.Config()
   deployment_bucket = config.get('project.deployment.bucket')
@@ -395,10 +400,7 @@ def _prod_deployment_helper(config_dir,
   project = gae_config.get('application_id')
 
   print('Deploying %s to prod.' % project)
-  if python3:
-    path = 'prod3'
-  else:
-    path = 'prod'
+  path = 'prod3'
 
   yaml_paths = gae_deployment.get_absolute_path(path, default=[])
   if not yaml_paths:
@@ -415,11 +417,12 @@ def _prod_deployment_helper(config_dir,
       deployment_bucket,
       yaml_paths,
       package_zip_paths,
-      deploy_appengine=deploy_appengine)
+      deploy_appengine=deploy_appengine,
+      test_deployment=test_deployment)
 
   if deploy_appengine:
-    common.execute('python butler.py run setup --config-dir {config_dir} '
-                   '--non-dry-run'.format(config_dir=config_dir))
+    common.execute(
+        f'python butler.py run setup --config-dir {config_dir} --non-dry-run')
 
   if deploy_k8s:
     _deploy_terraform(config_dir)
@@ -449,12 +452,12 @@ def _deploy_k8s(config_dir):
       f'--region={appengine.region(k8s_project)}')
   for workload in common.get_all_files(k8s_dir):
     # pylint:disable=anomalous-backslash-in-string
-    common.execute(f'envsubst \$REDIS_HOST < {workload} | kubectl apply -f -')
+    common.execute(fr'envsubst \$REDIS_HOST < {workload} | kubectl apply -f -')
 
   # Deploys cron jobs that are defined in the current instance configuration.
   for workload in common.get_all_files(k8s_instance_dir):
     # pylint:disable=anomalous-backslash-in-string
-    common.execute(f'envsubst \$REDIS_HOST < {workload} | kubectl apply -f -')
+    common.execute(fr'envsubst \$REDIS_HOST < {workload} | kubectl apply -f -')
 
 
 def execute(args):
@@ -515,14 +518,18 @@ def execute(args):
   deploy_zips = 'zips' in args.targets
   deploy_appengine = 'appengine' in args.targets
   deploy_k8s = 'k8s' in args.targets
+  test_deployment = 'test_deployment' in args.targets
 
-  is_python3 = sys.version_info.major == 3
+  if test_deployment:
+    deploy_appengine = False
+    deploy_k8s = False
+    deploy_zips = True
+
   package_zip_paths = []
   if deploy_zips:
     for platform_name in platforms:
       package_zip_paths.append(
-          package.package(
-              revision, platform_name=platform_name, python3=is_python3))
+          package.package(revision, platform_name=platform_name))
   else:
     # package.package calls these, so only set these up if we're not packaging,
     # since they can be fairly slow.
@@ -539,14 +546,14 @@ def execute(args):
     sys.exit(1)
 
   if args.staging:
-    _staging_deployment_helper(python3=is_python3)
+    _staging_deployment_helper()
   else:
     _prod_deployment_helper(
         args.config_dir,
         package_zip_paths,
         deploy_appengine,
         deploy_k8s,
-        python3=is_python3)
+        test_deployment=test_deployment)
 
   with open(constants.PACKAGE_TARGET_MANIFEST_PATH) as f:
     print('Source updated to %s' % f.read())

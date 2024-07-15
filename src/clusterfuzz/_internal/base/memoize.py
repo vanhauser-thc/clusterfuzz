@@ -46,7 +46,7 @@ def _redis_client():
   return _local.redis
 
 
-class FifoInMemory(object):
+class FifoInMemory:
   """In-memory caching engine."""
 
   def __init__(self, capacity):
@@ -89,7 +89,7 @@ class FifoInMemory(object):
     return _default_key(func, args, kwargs)
 
 
-class FifoOnDisk(object):
+class FifoOnDisk:
   """On-disk caching engine."""
 
   def __init__(self, capacity):
@@ -122,7 +122,7 @@ class FifoOnDisk(object):
     return _default_key(func, args, kwargs)
 
 
-class Memcache(object):
+class Memcache:
   """Memcache caching engine."""
 
   def __init__(self, ttl_in_seconds, key_fn=None):
@@ -138,7 +138,7 @@ class Memcache(object):
       _redis_client().set(
           json.dumps(key), json.dumps(value), ex=self.ttl_in_seconds)
     except redis.RedisError:
-      logs.log_error('Failed to store key in cache.', key=key, value=value)
+      logs.error('Failed to store key in cache.', key=key, value=value)
 
   @local_noop
   @if_redis_available
@@ -148,7 +148,7 @@ class Memcache(object):
     try:
       value_raw = _redis_client().get(json.dumps(key))
     except redis.RedisError:
-      logs.log_error('Failed to retrieve key from cache.', key=key)
+      logs.error('Failed to retrieve key from cache.', key=key)
       return None
 
     if value_raw is None:
